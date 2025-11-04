@@ -18,21 +18,22 @@ export const trpc = createTRPCReact<AppRouter>();
 /** Base URL สำหรับ HTTP (SSR ใช้ env, Client ใช้ relative) */
 export function getBaseUrl() {
     if (typeof window !== "undefined") return ""; // browser
-    return process.env.NEXT_PUBLIC_BASE_URL ?? "https://recurrently-sappy-roxane.ngrok-free.dev";
+    return process.env.NEXT_PUBLIC_BASE_URL ?? "http://localhost:3000";
 }
 
 /** URL สำหรับ WebSocket (ควรเป็น ws:// หรือ wss:// ให้ตรงกับหน้าเว็บ) */
 export function getWsUrl() {
-    if (typeof window === "undefined") {
-        // ฝั่ง server ใช้ env ได้ตามสะดวก
-        return process.env.NEXT_PUBLIC_WS_URL ?? "ws://meeting-dev-ws.loca.lt";
-    }
-    const protocol = location.protocol === "https:" ? "wss" : "ws";
-    const host = location.hostname;                // localhost
-    const port =
-        process.env.NEXT_PUBLIC_WS_PORT ||
-        (location.protocol === "https:" ? (location.port || "443") : "3001");
-    return `${protocol}://${host}:${port}`;
+    // if (typeof window === "undefined") {
+    //     // ฝั่ง server ใช้ env ได้ตามสะดวก
+    //     return process.env.NEXT_PUBLIC_WS_URL ?? "ws://recurrently-sappy-roxane.ngrok-free.dev";
+    // }
+    // const protocol = location.protocol === "https:" ? "wss" : "ws";
+    // const host = location.hostname;                // localhost
+    // const port =
+    //     process.env.NEXT_PUBLIC_WS_PORT ||
+    //     (location.protocol === "https:" ? (location.port || "443") : "3001");
+    // return `${protocol}://${host}:${port}`;
+    return process.env.NEXT_PUBLIC_WS_URL || 'ws://recurrently-sappy-roxane.ngrok-free.dev'
 }
 
 /**
@@ -42,6 +43,8 @@ export function getWsUrl() {
  */
 export function createTrpcClientOptions(): CreateTRPCClientOptions<AppRouter> {
     const isBrowser = typeof window !== "undefined";
+    const sss = getWsUrl()
+    console.log('sss', sss);
 
     return {
         transformer: superjson,

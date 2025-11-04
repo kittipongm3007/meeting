@@ -25,7 +25,7 @@ function parseJsonEnv(name: string): IceServer[] | null {
     const raw = process.env.NEXT_PUBLIC_RTC_ICE_JSON;
     if (!raw) return null;
     try {
-        const parsed = JSON.parse(raw);
+        const parsed = raw//JSON.parse(raw);
         if (Array.isArray(parsed)) {
             // ตรวจสอบคร่าว ๆ ว่าเป็นรูป IceServer
             return parsed.filter((x) => typeof x?.urls !== "undefined");
