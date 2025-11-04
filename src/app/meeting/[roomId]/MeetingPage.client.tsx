@@ -1,51 +1,36 @@
+// src/app/meeting/[roomId]/MeetingPage.client.tsx
 "use client";
 
 import * as React from "react";
-import { trpc } from "@/trpc/client";
-import { useLocalMedia, useMediaDevices } from "@/hooks/useMediaDevices";
+import RemoteVideos from "@/components/meeting/RemoteVideos";
 import { useWebRTC } from "@/hooks/useWebRTC";
-import { MeetingControls } from "@/components/meeting/MeetingControls";
-import { explainGetUserMediaError } from "@/lib/rtc/errors";
+import { trpc } from "@/trpc/client";
+import type { SdpInit, IceCandidateInitStrict } from "@/lib/rtc/signals";
 
-type Signal =
-    | { type: "offer"; from: string; to: string; sdp: any }
-    | { type: "answer"; from: string; to: string; sdp: any }
-    | { type: "ice"; from: string; to: string; candidate: any }
-    | { type: "peer-joined"; userId: string }
-    | { type: "peer-left"; userId: string };
+// อีเวนต์จาก server (ให้ตรงกับ tRPC router ฝั่ง server)
+type MeetingEvent =
+    | { type: "peer-joined"; roomId: string; userId: string }
+    | { type: "peer-left"; roomId: string; userId: string }
+    | { type: "offer"; roomId: string; from: string; to: string; sdp: SdpInit }
+    | { type: "answer"; roomId: string; from: string; to: string; sdp: SdpInit }
+    | {
+          type: "ice";
+          roomId: string;
+          from: string;
+          to: string;
+          candidate: IceCandidateInitStrict;
+      };
 
 export default function MeetingPage({ roomId }: { roomId: string }) {
-    // ----- ป้องกัน Hydration mismatch: สร้าง userId หลัง mount เท่านั้น
-    const [userId, setUserId] = React.useState<string>("");
-    React.useEffect(() => {
-        const id =
-            typeof crypto !== "undefined" && typeof crypto.randomUUID === "function"
-                ? crypto.randomUUID()
-                : `${Date.now()}-${Math.random().toString(16).slice(2)}`;
-        setUserId(id);
-    }, []);
+    // unique id ต่อแท็บ
+    const userId = React.useMemo<string>(
+        () => crypto?.randomUUID?.() ?? `${Date.now()}-${Math.random()}`,
+        []
+    );
 
-    const [errMsg, setErrMsg] = React.useState<string>("");
+    // mutation ส่งสัญญาณ
+    const sendSignalMutation = trpc.meeting.sendSignal.useMutation();
 
-    // ----- อุปกรณ์/มีเดียโลคัล
-    const { cams, mics } = useMediaDevices();
-    const {
-        state: local,
-        start,
-        stop,
-        toggleMic,
-        toggleCam,
-        switchCam,
-        switchMic,
-        startScreenShare,
-    } = useLocalMedia();
-
-    // ----- tRPC mutations/subscription
-    const join = trpc.meeting.joinRoom.useMutation();
-    const leave = trpc.meeting.leaveRoom.useMutation();
-    const sendSignalMut = trpc.meeting.sendSignal.useMutation();
-
-    // ----- ใช้ useWebRTC (ต่อสัญญาณกับ tRPC)
     const {
         attachLocalStream,
         remoteStreams,
@@ -53,245 +38,126 @@ export default function MeetingPage({ roomId }: { roomId: string }) {
         acceptOfferFrom,
         acceptAnswerFrom,
         addIceFrom,
-        teardownPeer, // เผื่อใช้ในอนาคต (peer-left)
-    } = useWebRTC(
-        roomId,
-        userId || "pending",
-        React.useCallback(
-            (msg: Signal) => {
-                // ฟังก์ชันส่งสัญญาณให้ useWebRTC เรียกใช้ (จัดรูปให้ตรงกับ router)
-                if (!userId) return;
-                if (msg.type === "offer") {
-                    sendSignalMut.mutate({
-                        type: "offer",
-                        roomId,
-                        from: userId,
-                        to: (msg as any).to,
-                        sdp: (msg as any).sdp,
-                    });
-                } else if (msg.type === "answer") {
-                    sendSignalMut.mutate({
-                        type: "answer",
-                        roomId,
-                        from: userId,
-                        to: (msg as any).to,
-                        sdp: (msg as any).sdp,
-                    });
-                } else if (msg.type === "ice") {
-                    sendSignalMut.mutate({
-                        type: "ice",
-                        roomId,
-                        from: userId,
-                        to: (msg as any).to,
-                        candidate: (msg as any).candidate,
-                    });
-                }
-            },
-            [roomId, userId, sendSignalMut]
-        )
-    );
+        teardownPeer,
+        peekPeers,
+    } = useWebRTC(roomId, userId, (msg) => sendSignalMutation.mutate(msg));
 
-    // ----- subscribe room events (offer/answer/ice/peer-joined/peer-left)
+    // subscription: รับสัญญาณจาก server
     trpc.meeting.roomEvents.useSubscription(
         { roomId, userId },
         {
-            // ⭐ สำคัญ: subscribe หลังมี userId แล้วเท่านั้น
-            enabled: !!roomId && !!userId,
-            onData: (data) => {
-                const msg = data as Signal;
-                if (!userId || !msg || typeof (msg as any).type !== "string") return;
+            onData: async (evt: MeetingEvent): Promise<void> => {
+                if (evt.roomId !== roomId) return;
 
-                // console.debug("[roomEvents]", msg);
+                switch (evt.type) {
+                    case "peer-joined":
+                        if (evt.userId !== userId) {
+                            await createOfferFor(evt.userId);
+                        }
+                        break;
 
-                // มีคนเข้าใหม่ → เราเป็นคนริเริ่มส่ง offer ไปหาเขา (แต่ห้ามยิงหา "ตัวเอง")
-                if (msg.type === "peer-joined" && msg.userId !== userId) {
-                    // ถ้ายังไม่ได้เริ่มกล้อง/ไมค์ เราก็ยังสร้าง offer ได้
-                    // (addLocalTracks จะข้ามไปก่อน แล้วค่อย replace/add ภายหลัง)
-                    createOfferFor(msg.userId);
-                    return;
-                }
+                    case "peer-left":
+                        teardownPeer(evt.userId);
+                        break;
 
-                // เราเป็น "ผู้รับ offer" เท่านั้นเมื่อ to === userId
-                if (msg.type === "offer" && msg.to === userId) {
-                    // ⭐ useWebRTC.acceptOfferFrom ใหม่ (ไม่ต้องส่ง peerId ตัวที่สามแล้ว)
-                    acceptOfferFrom(msg.from, msg.sdp);
-                    return;
-                }
+                    case "offer":
+                        if (evt.to === userId) {
+                            await acceptOfferFrom(evt.from, evt.sdp);
+                        }
+                        break;
 
-                // เราเป็น "ผู้รับ answer" เท่านั้นเมื่อ to === userId
-                if (msg.type === "answer" && msg.to === userId) {
-                    acceptAnswerFrom(msg.from, msg.sdp);
-                    return;
-                }
+                    case "answer":
+                        if (evt.to === userId) {
+                            await acceptAnswerFrom(evt.from, evt.sdp);
+                        }
+                        break;
 
-                // ผู้รับ ICE เท่านั้นเมื่อ to === userId
-                if (msg.type === "ice" && msg.to === userId) {
-                    addIceFrom(msg.from, msg.candidate);
-                    return;
-                }
-
-                if (msg.type === "peer-left") {
-                    // ถ้าต้องการปิด peer ทันที:
-                    teardownPeer(msg.userId);
-                    return;
+                    case "ice":
+                        if (evt.to === userId) {
+                            await addIceFrom(evt.from, evt.candidate);
+                        }
+                        break;
                 }
             },
         }
     );
 
-    // ----- lifecycle: join/leave room (และหยุดกล้องเมื่อออก)
+    // local media
+    const [localStream, setLocalStream] = React.useState<MediaStream | null>(
+        null
+    );
+
     React.useEffect(() => {
-        if (!userId) return;
-        join.mutate({ roomId, userId });
+        let cancelled = false;
+
+        (async () => {
+            try {
+                const stream = await navigator.mediaDevices.getUserMedia({
+                    video: true,
+                    audio: true,
+                });
+                if (!cancelled) {
+                    setLocalStream(stream);
+                    attachLocalStream(stream);
+                }
+            } catch (err) {
+                console.error("getUserMedia failed:", err);
+            }
+        })();
 
         return () => {
-            leave.mutate({ roomId, userId });
-            stop(); // ปิดกล้อง/ไมค์เมื่อออกจากหน้า
+            cancelled = true;
+            try {
+                localStream?.getTracks().forEach((t) => t.stop());
+            } catch {
+                // noop
+            }
         };
         // eslint-disable-next-line react-hooks/exhaustive-deps
-    }, [userId, roomId]);
+    }, [attachLocalStream]);
 
-    // ----- เริ่มกล้อง/ไมค์เมื่อผู้ใช้กดปุ่ม (ลดโอกาสโดนบล็อก)
-    const startMedia = React.useCallback(async () => {
-        try {
-            const s = await start({ audio: true, video: true });
-            attachLocalStream(s);
-            setErrMsg("");
-        } catch (e) {
-            setErrMsg(explainGetUserMediaError(e));
-        }
-    }, [start, attachLocalStream]);
-
-    // ----- ผูก local stream เข้ากับ video element
-    const localVideoRef = React.useRef<HTMLVideoElement | null>(null);
-    React.useEffect(() => {
-        if (localVideoRef.current && local.stream) {
-            localVideoRef.current.srcObject = local.stream;
-            localVideoRef.current.muted = true;
-            localVideoRef.current.play().catch(() => { });
-        }
-    }, [local.stream]);
+    // ผูก srcObject + play
+    const handleLocalVideoRef = React.useCallback(
+        (el: HTMLVideoElement | null): void => {
+            if (!el || !localStream) return;
+            if (el.srcObject !== localStream) el.srcObject = localStream;
+            void el.play().catch(() => {});
+        },
+        [localStream]
+    );
 
     return (
         <div className="p-4 space-y-4">
-            <header className="flex items-center justify-between">
-                <h1 className="text-xl font-semibold">Room: {roomId}</h1>
-                {userId && (
-                    <span className="text-xs text-muted-foreground">You: {userId.slice(0, 8)}</span>
-                )}
-            </header>
-
-            {errMsg && (
-                <div className="border border-red-300 bg-red-50 text-red-700 p-3 rounded-lg">
-                    กล้อง/ไมค์มีปัญหา: {errMsg}
-                </div>
-            )}
-
-            {!local.stream ? (
+            <div className="flex items-center gap-2">
                 <button
-                    onClick={startMedia}
-                    className="px-4 py-2 rounded-lg bg-black text-white"
-                    disabled={!userId}
+                    type="button"
+                    className="px-3 py-1 rounded bg-zinc-800 text-white"
+                    onClick={peekPeers}
                 >
-                    เริ่มใช้กล้อง/ไมค์
+                    Peek peers
                 </button>
-            ) : (
-                <MeetingControls
-                    micEnabled={local.micEnabled}
-                    camEnabled={local.camEnabled}
-                    onToggleMic={() => toggleMic()}
-                    onToggleCam={() => toggleCam()}
-                    onShareScreen={async () => {
-                        try {
-                            const s = await startScreenShare();
-                            if (!s) return;
-                            // แสดงหน้าจอแชร์ใน local preview ชั่วคราว
-                            if (localVideoRef.current) {
-                                localVideoRef.current.srcObject = s;
-                                localVideoRef.current.play().catch(() => { });
-                            }
-                            // เมื่อหยุดแชร์ → กลับไปกล้องเดิม
-                            const [track] = s.getVideoTracks();
-                            track.onended = () => {
-                                if (localVideoRef.current && local.stream) {
-                                    localVideoRef.current.srcObject = local.stream;
-                                    localVideoRef.current.play().catch(() => { });
-                                }
-                            };
-                        } catch (e) {
-                            setErrMsg(explainGetUserMediaError(e));
-                        }
-                    }}
-                />
-            )}
-
-            {/* เลือกอุปกรณ์ (ใช้ได้หลังเริ่มสตรีม) */}
-            <div className="flex flex-wrap gap-3 items-end">
-                <div className="flex flex-col">
-                    <label className="text-sm">Camera</label>
-                    <select
-                        className="border rounded-md p-2"
-                        onChange={(e) => switchCam(e.target.value)}
-                        disabled={!local.stream}
-                    >
-                        {cams.map((c) => (
-                            <option key={c.deviceId} value={c.deviceId}>
-                                {c.label}
-                            </option>
-                        ))}
-                    </select>
-                </div>
-                <div className="flex flex-col">
-                    <label className="text-sm">Microphone</label>
-                    <select
-                        className="border rounded-md p-2"
-                        onChange={(e) => switchMic(e.target.value)}
-                        disabled={!local.stream}
-                    >
-                        {mics.map((m) => (
-                            <option key={m.deviceId} value={m.deviceId}>
-                                {m.label}
-                            </option>
-                        ))}
-                    </select>
-                </div>
+                <span className="text-sm text-zinc-500">
+                    room: {roomId} • me: {userId.slice(0, 8)}
+                </span>
             </div>
 
-            {/* วิดีโอ */}
-            <div className="grid grid-cols-1 md:grid-cols-3 gap-4">
-                <div className="rounded-xl overflow-hidden border">
+            <div className="grid grid-cols-1 md:grid-cols-2 gap-3">
+                <div className="space-y-1">
+                    <div className="text-sm font-medium">My camera</div>
                     <video
-                        ref={localVideoRef}
-                        playsInline
+                        ref={handleLocalVideoRef}
                         autoPlay
-                        className="w-full h-64 bg-black object-cover"
+                        playsInline
+                        muted
+                        className="w-full bg-black rounded"
                     />
-                    <div className="p-2 text-sm text-center">
-                        You {userId ? `(${userId.slice(0, 6)})` : ""}
-                    </div>
                 </div>
 
-                {Object.entries(remoteStreams).map(([peerId, stream]) => (
-                    <RemoteVideo key={peerId} peerId={peerId} stream={stream} />
-                ))}
+                <div className="space-y-1">
+                    <div className="text-sm font-medium">Peers</div>
+                    <RemoteVideos remoteStreams={remoteStreams} />
+                </div>
             </div>
-        </div>
-    );
-}
-
-function RemoteVideo({ peerId, stream }: { peerId: string; stream: MediaStream }) {
-    const ref = React.useRef<HTMLVideoElement | null>(null);
-    React.useEffect(() => {
-        if (ref.current) {
-            ref.current.srcObject = stream;
-            // บางเบราว์เซอร์ต้อง call play() หลังเปลี่ยน srcObject
-            ref.current.play().catch(() => { });
-        }
-    }, [stream]);
-    return (
-        <div className="rounded-xl overflow-hidden border">
-            <video ref={ref} playsInline autoPlay className="w-full h-64 bg-black object-cover" />
-            <div className="p-2 text-sm text-center">Peer {peerId.slice(0, 6)}</div>
         </div>
     );
 }

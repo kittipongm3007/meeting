@@ -1,7 +1,7 @@
 // src/trpc/client.ts
 "use client";
 
-import { createTRPCReact } from "@trpc/react-query"; // v10
+import { createTRPCReact } from "@trpc/react-query";
 import type { AppRouter } from "@/server/routers/_app";
 import {
     httpBatchLink,
@@ -9,61 +9,82 @@ import {
     splitLink,
     createWSClient,
     wsLink,
-    type CreateTRPCClientOptions,
-} from "@trpc/client"; // v10
-import superjson from "superjson"; // v1
+    type TRPCLink,
+} from "@trpc/client";
+import superjson from "superjson";
+
+function getHttpBaseUrl(): string {
+    if (typeof window !== "undefined") return "";
+    const env = process.env.NEXT_PUBLIC_BASE_URL ?? "";
+    if (env) return env.replace(/\/+$/, "");
+    return "http://localhost:3000";
+}
+
+function getWsUrl(): string | null {
+    if (typeof window === "undefined") return null;
+    const env = process.env.NEXT_PUBLIC_WS_URL;
+    if (env && /^wss?:\/\//i.test(env)) return env;
+
+    const proto = window.location.protocol === "https:" ? "wss" : "ws";
+    const host = window.location.host;
+
+    const customPort =
+        process.env.NEXT_PUBLIC_WS_PORT && /^\d+$/.test(process.env.NEXT_PUBLIC_WS_PORT)
+            ? `:${process.env.NEXT_PUBLIC_WS_PORT}`
+            : "";
+
+    const hostWithPort = customPort
+        ? `${window.location.hostname}${customPort}`
+        : host;
+
+    return `${proto}://${hostWithPort}`;
+}
 
 export const trpc = createTRPCReact<AppRouter>();
 
-/** Base URL สำหรับ HTTP (SSR ใช้ env, Client ใช้ relative) */
-export function getBaseUrl() {
-    if (typeof window !== "undefined") return ""; // browser
-    return process.env.NEXT_PUBLIC_BASE_URL ?? "http://localhost:3000";
-}
-
-/** URL สำหรับ WebSocket (ควรเป็น ws:// หรือ wss:// ให้ตรงกับหน้าเว็บ) */
-export function getWsUrl() {
-    // if (typeof window === "undefined") {
-    //     // ฝั่ง server ใช้ env ได้ตามสะดวก
-    //     return process.env.NEXT_PUBLIC_WS_URL ?? "ws://recurrently-sappy-roxane.ngrok-free.dev";
-    // }
-    // const protocol = location.protocol === "https:" ? "wss" : "ws";
-    // const host = location.hostname;                // localhost
-    // const port =
-    //     process.env.NEXT_PUBLIC_WS_PORT ||
-    //     (location.protocol === "https:" ? (location.port || "443") : "3001");
-    // return `${protocol}://${host}:${port}`;
-    return process.env.NEXT_PUBLIC_WS_URL || 'ws://recurrently-sappy-roxane.ngrok-free.dev'
-}
-
 /**
- * ตัวเลือกสำหรับ trpc.createClient (v10)
- * - ใส่ transformer ที่ระดับบนสุด (superjson v1)
- * - เปิด wsLink เฉพาะฝั่ง browser
+ * คืนค่าเป็น array ปกติ (mutable) และระบุชนิดคืนค่าให้ชัดเจน
  */
-export function createTrpcClientOptions(): CreateTRPCClientOptions<AppRouter> {
-    const isBrowser = typeof window !== "undefined";
-    const sss = getWsUrl()
-    console.log('sss', sss);
+export function getTrpcClientLinks(): TRPCLink<AppRouter>[] {
+    const http = httpBatchLink({
+        url: `${getHttpBaseUrl()}/api/trpc`,
+    });
 
-    return {
-        transformer: superjson,
-        links: [
-            loggerLink({
-                enabled: (op) =>
-                    process.env.NODE_ENV === "development" ||
-                    (op.direction === "down" && op.result instanceof Error),
-            }),
+    // loggerLink ให้ชนิดเป็น TRPCLink<AnyRouter> → แคสต์ครั้งเดียวให้เป็น TRPCLink<AppRouter>
+    const base: TRPCLink<AppRouter>[] = [
+        loggerLink({
+            enabled: (opts) =>
+                process.env.NODE_ENV === "development" ||
+                (opts.direction === "down" && opts.result instanceof Error),
+        }) as unknown as TRPCLink<AppRouter>,
+    ];
+
+    const wsUrl = getWsUrl();
+    if (wsUrl) {
+        const wsClient = createWSClient({ url: wsUrl });
+        const ws = wsLink<AppRouter>({ client: wsClient });
+
+        // ใส่ splitLink เป็น element เดียว แล้วปล่อย queries/mutations ไป http, subscriptions ไป ws
+        base.push(
             splitLink({
-                condition: (op) => op.type === "subscription" && isBrowser,
-                true: wsLink({
-                    client: isBrowser ? createWSClient({ url: getWsUrl() }) : (undefined as any),
-                }),
-                false: httpBatchLink({
-                    url: `${getBaseUrl()}/api/trpc`,
-                    // headers() { return { ... } } // ถ้าต้องส่ง header เพิ่ม
-                }),
-            }),
-        ],
-    };
+                condition(op) {
+                    return op.type === "subscription";
+                },
+                true: ws,
+                false: http,
+            })
+        );
+    } else {
+        base.push(http);
+    }
+
+    return base; // ← array ปกติ ไม่ใช่ readonly tuple
+}
+
+/** ใช้ตัวนี้ใน <Providers> */
+export function createTrpcClient() {
+    return trpc.createClient({
+        transformer: superjson,          // ใส่ transformer ที่นี่ (ไม่ใช่ใน httpBatchLink)
+        links: getTrpcClientLinks(),     // ← now mutable TRPCLink<AppRouter>[]
+    });
 }

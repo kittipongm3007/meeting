@@ -1,31 +1,42 @@
 // src/lib/rtc/signals.ts
+export type SdpInit = {
+    type: "offer" | "answer";
+    sdp: string;
+};
+
+// เข้มงวดกับ ICE: candidate ต้องเป็น string
+export type IceCandidateInitStrict = {
+    candidate: string;
+    sdpMid?: string | null;
+    sdpMLineIndex?: number | null;
+    usernameFragment?: string | null;
+};
+
 export type OfferSignal = {
     type: "offer";
+    roomId: string;
     from: string;
     to: string;
-    sdp: RTCSessionDescriptionInit; // ← ใช้ชนิด WebRTC โดยตรง
+    sdp: SdpInit;
 };
 
 export type AnswerSignal = {
     type: "answer";
+    roomId: string;
     from: string;
     to: string;
-    sdp: RTCSessionDescriptionInit;
+    sdp: SdpInit;
 };
 
 export type IceSignal = {
     type: "ice";
+    roomId: string;
     from: string;
     to: string;
-    candidate: RTCIceCandidateInit; // ← ใช้ชนิด WebRTC โดยตรง
+    candidate: IceCandidateInitStrict;
 };
 
-export type PeerJoinedSignal = { type: "peer-joined"; userId: string };
-export type PeerLeftSignal = { type: "peer-left"; userId: string };
+export type PeerJoined = { type: "peer-joined"; roomId: string; userId: string };
+export type PeerLeft = { type: "peer-left"; roomId: string; userId: string };
 
-export type Signal =
-    | OfferSignal
-    | AnswerSignal
-    | IceSignal
-    | PeerJoinedSignal
-    | PeerLeftSignal;
+export type Signal = OfferSignal | AnswerSignal | IceSignal | PeerJoined | PeerLeft;
