@@ -1,0 +1,25 @@
+version: "3.9"
+services:
+  web:
+    build: ./web         # โฟลเดอร์ Next.js
+    ports:
+      - "3000:3000"
+    environment:
+      NODE_ENV: development
+      NEXT_PUBLIC_BASE_URL: "http://localhost:3000"
+      NEXT_PUBLIC_WS_URL: "ws://localhost:3001"
+    volumes:
+      - ./web:/app
+    command: "npm run dev"  # หรือ next start ถ้า build แล้ว
+    depends_on:
+      - ws
+
+  ws:
+    build: ./ws          # โฟลเดอร์เซิร์ฟเวอร์ WS (tRPC WS)
+    ports:
+      - "3001:3001"
+    environment:
+      NODE_ENV: development
+    volumes:
+      - ./ws:/app
+    command: "node dist/wsServer.js" # หรือ "npm run dev" ถ้า ts-node
