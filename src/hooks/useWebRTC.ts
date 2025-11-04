@@ -21,11 +21,19 @@ export function useWebRTC(roomId: string, userId: string, sendSignal: SendSignal
     }
     const peers = peersRef.current!;
 
+    // เก็บตัว unbind ของ handler removetrack ต่อ peer (เพื่อ cleanup)
+    const removeHandlersRef = useRef<Map<PeerId, () => void>>(new Map());
+
     // ลบ peer ทั้งหมดเมื่อ unmount (กัน resource ค้าง)
     useEffect(() => {
         return () => {
             try {
-                peers.clear();
+                // cleanup handlers ก่อน
+                for (const [peerId, unbind] of removeHandlersRef.current) {
+                    try { unbind(); } catch { }
+                    removeHandlersRef.current.delete(peerId);
+                }
+                peers.clear?.();
             } catch { }
         };
         // eslint-disable-next-line react-hooks/exhaustive-deps
@@ -56,17 +64,97 @@ export function useWebRTC(roomId: string, userId: string, sendSignal: SendSignal
         [peers]
     );
 
-    /** sync remoteStreams -> state */
-    const _syncRemote = useCallback(() => {
-        const obj: Record<string, MediaStream> = {};
-        for (const [id, rec] of peers.all()) {
-            // sync เฉพาะ stream ที่มี track แล้ว เพื่อลด flicker/ว่าง
-            if (rec.remoteStream && rec.remoteStream.getTracks().length > 0) {
-                obj[id] = rec.remoteStream;
+    /** ผูกตัวฟัง removetrack/onended ให้กับ remoteStream ของ peerId (และคืนฟังก์ชันสำหรับ cleanup) */
+    const bindRemoteRemoveHandlers = useCallback(
+        (peerId: PeerId) => {
+            const rec = peers.get(peerId);
+            if (!rec || !rec.remoteStream) return;
+
+            // ถ้ามีตัวเดิมอยู่แล้ว ให้ unbind ก่อนเพื่อกันซ้ำ
+            const oldUnbind = removeHandlersRef.current.get(peerId);
+            if (oldUnbind) {
+                try { oldUnbind(); } catch { }
+                removeHandlersRef.current.delete(peerId);
             }
-        }
-        setRemoteStreams(obj);
-    }, [peers]);
+
+            const handleRemove = () => {
+                const s = rec.remoteStream!;
+                // สร้าง stream ใหม่จาก tracks ที่ยังไม่จบ
+                const tracks = s.getTracks().filter((t) => t.readyState !== "ended");
+                const newStream = new MediaStream(tracks);
+                rec.remoteStream = newStream;
+
+                setRemoteStreams((prev) => {
+                    if (newStream.getTracks().length === 0) {
+                        const { [peerId]: _, ...rest } = prev;
+                        return rest;
+                    }
+                    return { ...prev, [peerId]: newStream };
+                });
+            };
+
+            // ฟัง removetrack บน MediaStream
+            const onRemoveTrack = (ev: Event) => {
+                // แต่ไม่จำเป็นต้องอ่านค่าในอีเวนต์นี้ เรา re-scan tracks อยู่แล้ว
+                handleRemove();
+            };
+            rec.remoteStream.addEventListener("removetrack", onRemoveTrack);
+
+            // เผื่อ track จบเอง
+            const trackEndCleanups: Array<() => void> = [];
+            rec.remoteStream.getTracks().forEach((t) => {
+                const prev = t.onended;
+                t.onended = (ev) => {
+                    try { prev?.call(t, ev as Event); } catch { }
+                    handleRemove();
+                };
+                trackEndCleanups.push(() => { t.onended = prev || null; });
+            });
+
+            // เก็บ unbind ไว้
+            const unbind = () => {
+                try { rec.remoteStream?.removeEventListener("removetrack", onRemoveTrack); } catch { }
+                trackEndCleanups.forEach((fn) => {
+                    try { fn(); } catch { }
+                });
+            };
+            removeHandlersRef.current.set(peerId, unbind);
+        },
+        [peers]
+    );
+
+    /** add local tracks (กันซ้ำตาม kind) + renegotiate ถ้าพึ่งเพิ่ม */
+    const addLocalTracks = useCallback(
+        async (peerId: string) => {
+            const rec = peers.get(peerId)!;
+            const ls = localStreamRef.current;
+            if (!ls) return;
+
+            const existingKinds = new Set(
+                rec.pc.getSenders().map((s) => s.track?.kind).filter(Boolean) as string[]
+            );
+
+            let added = false;
+            ls.getTracks().forEach((track) => {
+                if (!existingKinds.has(track.kind)) {
+                    rec.pc.addTrack(track, ls);
+                    added = true;
+                }
+            });
+
+            // ถ้าเพิ่งเพิ่ม track และ signalingState พร้อม → renegotiate
+            if (added && rec.pc.signalingState !== "closed") {
+                try {
+                    const offer = await rec.pc.createOffer();
+                    await rec.pc.setLocalDescription(offer);
+                    sendRef.current({ type: "offer", from: userId, to: peerId, sdp: offer });
+                } catch (e) {
+                    console.warn(`[PC:${peerId}] renegotiate failed`, e);
+                }
+            }
+        },
+        [peers, userId]
+    );
 
     /** bind handlers ให้ peer (hook เป็นคนผูก handler ที่เดียว) */
     const addRemoteHandlers = useCallback(
@@ -75,12 +163,30 @@ export function useWebRTC(roomId: string, userId: string, sendSignal: SendSignal
 
             rec.pc.onsignalingstatechange = () =>
                 console.log(`[PC:${peerId}] signaling=`, rec.pc.signalingState);
-            rec.pc.onconnectionstatechange = () =>
+
+            rec.pc.onconnectionstatechange = () => {
                 console.log(`[PC:${peerId}] conn=`, rec.pc.connectionState);
+                if (["failed", "disconnected", "closed"].includes(rec.pc.connectionState)) {
+                    // cleanup listener
+                    const unbind = removeHandlersRef.current.get(peerId);
+                    if (unbind) {
+                        try { unbind(); } catch { }
+                        removeHandlersRef.current.delete(peerId);
+                    }
+                    // ลบ stream ออกจาก state
+                    setRemoteStreams((prev) => {
+                        const { [peerId]: _, ...rest } = prev;
+                        return rest;
+                    });
+                }
+            };
+
             rec.pc.oniceconnectionstatechange = () =>
                 console.log(`[PC:${peerId}] ice=`, rec.pc.iceConnectionState);
 
             rec.pc.ontrack = (e) => {
+                console.log("ontrack:", peerId, e.streams?.[0], e.track?.kind);
+
                 // ส่วนใหญ่ stream จะมากับ e.streams[0]
                 const incoming = e.streams?.[0];
                 if (incoming) {
@@ -91,8 +197,14 @@ export function useWebRTC(roomId: string, userId: string, sendSignal: SendSignal
                     }
                     rec.remoteStream.addTrack(e.track);
                 }
-                // รอ 1 tick ให้ tracks ผูกเสร็จก่อน sync
-                setTimeout(_syncRemote, 0);
+
+                // อัปเดต state ทันที
+                if (rec.remoteStream && rec.remoteStream.getTracks().length > 0) {
+                    setRemoteStreams((prev) => ({ ...prev, [peerId]: rec.remoteStream! }));
+                }
+
+                // ผูก removetrack/onended บน MediaStream (ไม่ใช่บน RTCPeerConnection)
+                bindRemoteRemoveHandlers(peerId);
             };
 
             rec.pc.onicecandidate = (e) => {
@@ -104,45 +216,21 @@ export function useWebRTC(roomId: string, userId: string, sendSignal: SendSignal
                 }
             };
         },
-        [peers, _syncRemote, userId]
-    );
-
-    /** add local tracks (กันซ้ำตาม kind) */
-    const addLocalTracks = useCallback(
-        (peerId: string) => {
-            const rec = peers.get(peerId)!;
-            const ls = localStreamRef.current;
-            if (!ls) return;
-
-            const existingKinds = new Set(
-                rec.pc.getSenders().map((s) => s.track?.kind).filter(Boolean) as string[]
-            );
-
-            ls.getTracks().forEach((track) => {
-                if (!existingKinds.has(track.kind)) {
-                    rec.pc.addTrack(track, ls);
-                }
-            });
-        },
-        [peers]
+        [peers, userId, bindRemoteRemoveHandlers]
     );
 
     /** Caller → สร้าง offer และส่ง */
     const createOfferFor = useCallback(
         async (peerId: string) => {
             const rec = peers.create(userId, peerId);
-            console.log('rec', rec);
-
             addRemoteHandlers(peerId);
-            addLocalTracks(peerId);
+            await addLocalTracks(peerId);
 
             const offer = await rec.pc.createOffer({
                 offerToReceiveAudio: true,
                 offerToReceiveVideo: true,
             });
-            console.log(`[PC:${peerId}] OFFER created len=${offer.sdp?.length}`);
             await rec.pc.setLocalDescription(offer);
-            console.log(`[PC:${peerId}] OFFER setLocalDescription OK`);
 
             sendRef.current({ type: "offer", from: userId, to: peerId, sdp: offer });
             console.log(`[WS→] offer sent → ${peerId}`);
@@ -152,19 +240,14 @@ export function useWebRTC(roomId: string, userId: string, sendSignal: SendSignal
 
     /** Callee → รับ offer แล้วตอบ answer กลับ */
     const acceptOfferFrom = useCallback(
-        async (fromId: string, sdp: RTCSessionDescriptionInit, _peerId?: string) => {
-            // สำคัญ: selfId = userId, peerId = fromId (อย่าสลับ)
+        async (fromId: string, sdp: RTCSessionDescriptionInit) => {
             const rec = peers.create(userId, fromId);
             addRemoteHandlers(fromId);
-            addLocalTracks(fromId);
+            await addLocalTracks(fromId);
 
             await rec.pc.setRemoteDescription(sdp);
-            console.log(`[PC:${fromId}] setRemoteDescription(offer) OK`);
-
             const answer = await rec.pc.createAnswer();
-            console.log(`[PC:${fromId}] ANSWER created len=${answer.sdp?.length}`);
             await rec.pc.setLocalDescription(answer);
-            console.log(`[PC:${fromId}] ANSWER setLocalDescription OK`);
 
             sendRef.current({ type: "answer", from: userId, to: fromId, sdp: answer });
             console.log(`[WS→] answer sent → ${fromId}`);
@@ -200,10 +283,20 @@ export function useWebRTC(roomId: string, userId: string, sendSignal: SendSignal
     /** ปิด/ลบ peer */
     const teardownPeer = useCallback(
         (peerId: string) => {
+            // unbind removetrack/onended
+            const unbind = removeHandlersRef.current.get(peerId);
+            if (unbind) {
+                try { unbind(); } catch { }
+                removeHandlersRef.current.delete(peerId);
+            }
+
             peers.delete(peerId);
-            _syncRemote();
+            setRemoteStreams((prev) => {
+                const { [peerId]: _, ...rest } = prev;
+                return rest;
+            });
         },
-        [peers, _syncRemote]
+        [peers]
     );
 
     return {
