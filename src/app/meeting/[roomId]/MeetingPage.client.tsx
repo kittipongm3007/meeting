@@ -8,6 +8,11 @@ import { getIceServers } from "@/lib/rtc/ice";
 
 type PeerMap = Map<string, RTCPeerConnection>;
 
+function log(...args: any[]) {
+    const ts = new Date().toISOString().split("T")[1].replace("Z", "");
+    console.log(`[MEETING ${ts}]`, ...args);
+}
+
 export default function MeetingPage({ roomId }: { roomId: string }) {
     const router = useRouter();
     const [userId] = React.useState(() => crypto.randomUUID());
@@ -23,70 +28,92 @@ export default function MeetingPage({ roomId }: { roomId: string }) {
     const localStreamRef = React.useRef<MediaStream | null>(null);
 
     React.useEffect(() => {
-        const base = typeof window !== "undefined" ? window.location.origin : "";
+        const base =
+            typeof window !== "undefined" ? window.location.origin : "";
         setShareUrl(`${base}/meeting/${roomId}`);
     }, [roomId]);
 
-    // --- เข้าห้อง
     const joinMutation = trpc.meeting.joinRoom.useMutation();
     const leaveMutation = trpc.meeting.leaveRoom.useMutation();
     const sendSignal = trpc.meeting.sendSignal.useMutation();
 
-    function log(...args: any[]) {
-        const ts = new Date().toISOString().split("T")[1].replace("Z", "");
-        console.log(`xxxxxxxxs[MEETING ${ts}]`, ...args);
-    }
-    // --- subscribe events ของห้อง
-    trpc.meeting.roomEvents.useSubscription({ roomId }, {
-        onData: async (evt) => {
-            log("EVENT <-", evt.type, evt);
+    // เปิด sub ทันที แล้วกรองด้วย logic ภายใน
+    trpc.meeting.roomEvents.useSubscription(
+        { roomId },
+        {
+            onData: async (evt) => {
+                log("EVENT <-", evt.type, evt);
 
-            if (evt.type === "peer-joined" && evt.userId !== userId) {
-                log("peer-joined:", evt.userId, "→ createAndSendOffer");
-                await createAndSendOffer(evt.userId);
-            }
-            if (evt.type === "peer-left") {
-                log("peer-left:", evt.userId);
-                teardownPeer(evt.userId);
-            }
-            if (evt.type === "offer" && evt.to === userId) {
-                log("OFFER <- from", evt.from, "len", JSON.stringify(evt.sdp).length);
-                await handleRemoteOffer(evt.from, evt.sdp);
-            }
-            if (evt.type === "answer" && evt.to === userId) {
-                log("ANSWER <- from", evt.from, "len", JSON.stringify(evt.sdp).length);
-                await handleRemoteAnswer(evt.from, evt.sdp);
-            }
-            if (evt.type === "ice" && evt.to === userId) {
-                log("ICE <- from", evt.from);
-                const pc = peersRef.current.get(evt.from);
-                if (pc) {
-                    try { await pc.addIceCandidate(evt.candidate); }
-                    catch (e) { console.error("addIceCandidate error", e); }
+                if (
+                    evt.type === "peer-joined" &&
+                    evt.userId !== userId &&
+                    joined
+                ) {
+                    log("peer-joined:", evt.userId, "→ createAndSendOffer");
+                    await createAndSendOffer(evt.userId);
                 }
-            }
-        },
-    });
+                if (evt.type === "peer-left") {
+                    log("peer-left:", evt.userId);
+                    teardownPeer(evt.userId);
+                }
+
+                if (evt.type === "offer" && evt.to === userId) {
+                    log("OFFER <- from", evt.from);
+                    await handleRemoteOffer(evt.from, evt.sdp);
+                }
+                if (evt.type === "answer" && evt.to === userId) {
+                    log("ANSWER <- from", evt.from);
+                    await handleRemoteAnswer(evt.from, evt.sdp);
+                }
+                if (evt.type === "ice" && evt.to === userId) {
+                    const pc = peersRef.current.get(evt.from);
+                    if (pc) {
+                        try {
+                            await pc.addIceCandidate(evt.candidate);
+                            log("ICE applied from", evt.from);
+                        } catch (e) {
+                            console.error("addIceCandidate error", e);
+                        }
+                    }
+                }
+            },
+        }
+    );
 
     async function getLocalStream() {
         if (localStreamRef.current) return localStreamRef.current;
-        const s = await navigator.mediaDevices.getUserMedia({ audio: true, video: true });
+        const s = await navigator.mediaDevices.getUserMedia({
+            audio: true,
+            video: true,
+        });
         localStreamRef.current = s;
         if (localVideoRef.current) {
             localVideoRef.current.srcObject = s;
             localVideoRef.current.muted = true;
-            await localVideoRef.current.play().catch(() => { });
+            await localVideoRef.current.play().catch(() => {});
         }
+        log(
+            "got local stream tracks:",
+            s.getTracks().map((t) => t.kind)
+        );
         return s;
     }
 
-    function ensurePeer(remoteId: string) {
+    // ✅ ทำให้เป็น async และ await addTrack ก่อนสร้าง offer/answer
+    async function ensurePeer(remoteId: string) {
         let pc = peersRef.current.get(remoteId);
         if (pc) return pc;
 
         pc = new RTCPeerConnection({ iceServers: getIceServers() });
 
-        // ส่ง ICE ออกไป
+        pc.onconnectionstatechange = () =>
+            log(remoteId, "pc.connectionState:", pc!.connectionState);
+        pc.oniceconnectionstatechange = () =>
+            log(remoteId, "pc.iceConnectionState:", pc!.iceConnectionState);
+        pc.onsignalingstatechange = () =>
+            log(remoteId, "pc.signalingState:", pc!.signalingState);
+        pc.onnegotiationneeded = () => log(remoteId, "pc.onnegotiationneeded");
+
         pc.onicecandidate = (e) => {
             if (e.candidate) {
                 sendSignal.mutate({
@@ -96,30 +123,51 @@ export default function MeetingPage({ roomId }: { roomId: string }) {
                     to: remoteId,
                     candidate: e.candidate.toJSON(),
                 });
+                log("ICE -> to", remoteId);
             }
         };
 
-        // เมื่อได้ remote track
+        pc.onicecandidateerror = (e: any) => {
+            console.warn("ICE error:", e?.errorText ?? e);
+        };
+
         pc.ontrack = (evt) => {
             const stream = evt.streams[0];
+            log(
+                remoteId,
+                "ontrack:",
+                evt.track.kind,
+                "streams:",
+                evt.streams.length
+            );
             setRemoteStreams((prev) => {
                 const others = prev.filter((x) => x.userId !== remoteId);
                 return [...others, { userId: remoteId, stream }];
             });
         };
 
-        // ใส่ local tracks
-        (async () => {
-            const ls = await getLocalStream();
-            ls.getTracks().forEach((t) => pc!.addTrack(t, ls));
-        })();
+        // รอให้ local tracks ถูก add จริง ๆ ก่อน
+        const ls = await getLocalStream();
+        ls.getTracks().forEach((t) => pc!.addTrack(t, ls));
+        log(
+            "addTrack ->",
+            remoteId,
+            ls.getTracks().map((t) => t.kind)
+        );
+
+        // กันเคสอีกฝั่งยังไม่ addTrack ตอนแรก (optional แต่ช่วยได้)
+        if (pc.getTransceivers().length === 0) {
+            pc.addTransceiver("audio", { direction: "recvonly" });
+            pc.addTransceiver("video", { direction: "recvonly" });
+            log(remoteId, "add recvonly transceivers");
+        }
 
         peersRef.current.set(remoteId, pc);
         return pc;
     }
 
     async function createAndSendOffer(remoteId: string) {
-        const pc = ensurePeer(remoteId);
+        const pc = await ensurePeer(remoteId); // ✅ ต้อง await
         const offer = await pc.createOffer();
         await pc.setLocalDescription(offer);
         sendSignal.mutate({
@@ -129,11 +177,12 @@ export default function MeetingPage({ roomId }: { roomId: string }) {
             to: remoteId,
             sdp: offer,
         });
+        log("OFFER -> to", remoteId);
     }
 
     async function handleRemoteOffer(fromId: string, sdp: any) {
-        const pc = ensurePeer(fromId);
-        await pc.setRemoteDescription(new RTCSessionDescription(sdp));
+        const pc = await ensurePeer(fromId); // ✅ ต้อง await
+        await pc.setRemoteDescription(sdp as RTCSessionDescriptionInit);
         const answer = await pc.createAnswer();
         await pc.setLocalDescription(answer);
         sendSignal.mutate({
@@ -143,12 +192,14 @@ export default function MeetingPage({ roomId }: { roomId: string }) {
             to: fromId,
             sdp: answer,
         });
+        log("ANSWER -> to", fromId);
     }
 
     async function handleRemoteAnswer(fromId: string, sdp: any) {
         const pc = peersRef.current.get(fromId);
         if (!pc) return;
-        await pc.setRemoteDescription(new RTCSessionDescription(sdp));
+        await pc.setRemoteDescription(sdp as RTCSessionDescriptionInit);
+        log("setRemoteDescription(answer) from", fromId);
     }
 
     function teardownPeer(remoteId: string) {
@@ -164,12 +215,13 @@ export default function MeetingPage({ roomId }: { roomId: string }) {
     async function join() {
         await getLocalStream();
 
-        // รับรายชื่อ user ในห้อง (รวมเราด้วย)
         const res = await joinMutation.mutateAsync({ roomId, userId });
+        log("JOIN ok, users:", res.users);
         setJoined(true);
 
-        // สร้าง offer ไปหา "ผู้ที่อยู่ในห้องอยู่แล้ว" ทันที
+        // ✅ ยิง offer ไปหา “ผู้ที่อยู่ก่อนแล้ว”
         const others = (res?.users ?? []).filter((u) => u !== userId);
+        log("PEERS already in room:", others);
         for (const uid of others) {
             await createAndSendOffer(uid);
         }
@@ -190,30 +242,36 @@ export default function MeetingPage({ roomId }: { roomId: string }) {
         ls.getVideoTracks().forEach((t) => (t.enabled = !t.enabled));
     }
     async function shareScreen() {
-        const ds = await (navigator.mediaDevices as any).getDisplayMedia?.({ video: true, audio: true }).catch(() => null);
+        const ds = await (navigator.mediaDevices as any)
+            .getDisplayMedia?.({ video: true, audio: true })
+            .catch(() => null);
         if (!ds) return;
         const videoTrack = ds.getVideoTracks()[0];
-        // สลับ track กับ peers
+
         peersRef.current.forEach((pc) => {
-            const sender = pc.getSenders().find((s) => s.track?.kind === "video");
+            const sender = pc
+                .getSenders()
+                .find((s) => s.track?.kind === "video");
             if (sender && videoTrack) sender.replaceTrack(videoTrack);
         });
-        // แสดงบน local
+
         if (localVideoRef.current) {
             localVideoRef.current.srcObject = ds;
-            await localVideoRef.current.play().catch(() => { });
+            await localVideoRef.current.play().catch(() => {});
         }
-        // เมื่อจบแชร์ คืนค่าเดิม
+
         videoTrack.onended = async () => {
             const ls = await getLocalStream();
             const camTrack = ls.getVideoTracks()[0];
             peersRef.current.forEach((pc) => {
-                const sender = pc.getSenders().find((s) => s.track?.kind === "video");
+                const sender = pc
+                    .getSenders()
+                    .find((s) => s.track?.kind === "video");
                 if (sender && camTrack) sender.replaceTrack(camTrack);
             });
             if (localVideoRef.current) {
                 localVideoRef.current.srcObject = ls;
-                await localVideoRef.current.play().catch(() => { });
+                await localVideoRef.current.play().catch(() => {});
             }
         };
     }
@@ -230,7 +288,9 @@ export default function MeetingPage({ roomId }: { roomId: string }) {
     return (
         <main className="min-h-[60vh] max-w-5xl mx-auto p-6">
             <h1 className="text-2xl font-semibold mb-2">ห้องประชุม</h1>
-            <p className="text-gray-600 mb-4">แชร์ลิงก์นี้ให้เพื่อนเพื่อเข้าห้องเดียวกัน</p>
+            <p className="text-gray-600 mb-4">
+                แชร์ลิงก์นี้ให้เพื่อนเพื่อเข้าห้องเดียวกัน
+            </p>
 
             <div className="rounded-xl border p-4 mb-4">
                 <div className="text-sm text-gray-500">Room ID</div>
@@ -240,27 +300,70 @@ export default function MeetingPage({ roomId }: { roomId: string }) {
             <div className="rounded-xl border p-4 mb-6">
                 <div className="text-sm text-gray-500 mb-1">ลิงก์ห้อง</div>
                 <div className="flex gap-2 items-center">
-                    <input readOnly value={shareUrl} className="flex-1 rounded-md border px-3 py-2 font-mono text-sm" />
-                    <button onClick={copyLink} className="rounded-lg px-3 py-2 bg-gray-900 text-white hover:bg-black">คัดลอก</button>
+                    <input
+                        readOnly
+                        value={shareUrl}
+                        className="flex-1 rounded-md border px-3 py-2 font-mono text-sm"
+                    />
+                    <button
+                        onClick={copyLink}
+                        className="rounded-lg px-3 py-2 bg-gray-900 text-white hover:bg-black"
+                    >
+                        คัดลอก
+                    </button>
                 </div>
             </div>
 
             <div className="flex flex-wrap gap-3 mb-6">
                 {!joined ? (
-                    <button onClick={join} className="rounded-lg px-4 py-2 bg-blue-600 text-white hover:bg-blue-700">เข้าร่วมการประชุม</button>
+                    <button
+                        onClick={join}
+                        className="rounded-lg px-4 py-2 bg-blue-600 text-white hover:bg-blue-700"
+                    >
+                        เข้าร่วมการประชุม
+                    </button>
                 ) : (
-                    <button onClick={leave} className="rounded-lg px-4 py-2 border">ออกจากห้อง</button>
+                    <button
+                        onClick={leave}
+                        className="rounded-lg px-4 py-2 border"
+                    >
+                        ออกจากห้อง
+                    </button>
                 )}
-                <button onClick={toggleMic} className="rounded-lg px-4 py-2 border">สลับไมค์</button>
-                <button onClick={toggleCam} className="rounded-lg px-4 py-2 border">สลับกล้อง</button>
-                <button onClick={shareScreen} className="rounded-lg px-4 py-2 border">แชร์หน้าจอ</button>
-                <button onClick={() => router.push("/meeting")} className="rounded-lg px-4 py-2 border">สร้างห้องใหม่</button>
+                <button
+                    onClick={toggleMic}
+                    className="rounded-lg px-4 py-2 border"
+                >
+                    สลับไมค์
+                </button>
+                <button
+                    onClick={toggleCam}
+                    className="rounded-lg px-4 py-2 border"
+                >
+                    สลับกล้อง
+                </button>
+                <button
+                    onClick={shareScreen}
+                    className="rounded-lg px-4 py-2 border"
+                >
+                    แชร์หน้าจอ
+                </button>
+                <button
+                    onClick={() => router.push("/meeting")}
+                    className="rounded-lg px-4 py-2 border"
+                >
+                    สร้างห้องใหม่
+                </button>
             </div>
 
             <div className="grid md:grid-cols-2 gap-4">
                 <div className="rounded-xl border p-2">
                     <div className="text-sm text-gray-500 mb-1">Local</div>
-                    <video ref={localVideoRef} playsInline className="w-full rounded-lg bg-black" />
+                    <video
+                        ref={localVideoRef}
+                        playsInline
+                        className="w-full rounded-lg bg-black"
+                    />
                 </div>
 
                 {remoteStreams.map(({ userId: uid, stream }) => (
@@ -271,18 +374,30 @@ export default function MeetingPage({ roomId }: { roomId: string }) {
     );
 }
 
-function RemoteVideo({ userId, stream }: { userId: string; stream: MediaStream }) {
+function RemoteVideo({
+    userId,
+    stream,
+}: {
+    userId: string;
+    stream: MediaStream;
+}) {
     const ref = React.useRef<HTMLVideoElement>(null);
     React.useEffect(() => {
         if (ref.current) {
             ref.current.srcObject = stream;
-            ref.current.play().catch(() => { });
+            ref.current.play().catch(() => {});
         }
     }, [stream]);
     return (
         <div className="rounded-xl border p-2">
-            <div className="text-sm text-gray-500 mb-1">Remote — {userId.slice(0, 8)}</div>
-            <video ref={ref} playsInline className="w-full rounded-lg bg-black" />
+            <div className="text-sm text-gray-500 mb-1">
+                Remote — {userId.slice(0, 8)}
+            </div>
+            <video
+                ref={ref}
+                playsInline
+                className="w-full rounded-lg bg-black"
+            />
         </div>
     );
 }

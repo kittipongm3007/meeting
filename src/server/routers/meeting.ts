@@ -31,9 +31,7 @@ export const meetingRouter = router({
     .mutation(({ input }) => {
       const room = getRoom(input.roomId);
       room.users.add(input.userId);
-      // แจ้งทุกคนว่ามีคนเข้า
       console.log("[JOIN]", input.roomId, input.userId, "users:", Array.from(room.users));
-
       room.subs.forEach((cb) =>
         cb({ type: "peer-joined", roomId: input.roomId, userId: input.userId })
       );
@@ -45,6 +43,7 @@ export const meetingRouter = router({
     .mutation(({ input }) => {
       const room = getRoom(input.roomId);
       room.users.delete(input.userId);
+      console.log("[LEAVE]", input.roomId, input.userId);
       room.subs.forEach((cb) =>
         cb({ type: "peer-left", roomId: input.roomId, userId: input.userId })
       );
@@ -78,17 +77,11 @@ export const meetingRouter = router({
       ])
     )
     .mutation(({ input }) => {
-      const room = getRoom(input.roomId);
-      if (input.type === "offer") {
-        console.log("[OFFER]", input.roomId, `${input.from} -> ${input.to}`);
-      }
-      if (input.type === "answer") {
-        console.log("[ANSWER]", input.roomId, `${input.from} -> ${input.to}`);
-      }
-      if (input.type === "ice") {
-        console.log("[ICE]", input.roomId, `${input.from} -> ${input.to}`);
-      }
+      if (input.type === "offer") console.log("[OFFER]", input.roomId, `${input.from} -> ${input.to}`);
+      if (input.type === "answer") console.log("[ANSWER]", input.roomId, `${input.from} -> ${input.to}`);
+      if (input.type === "ice") console.log("[ICE]", input.roomId, `${input.from} -> ${input.to}`);
 
+      const room = getRoom(input.roomId);
       room.subs.forEach((cb) => cb(input as any));
       return { ok: true };
     }),
@@ -96,6 +89,7 @@ export const meetingRouter = router({
   roomEvents: publicProcedure
     .input(z.object({ roomId: z.string().min(1) }))
     .subscription(({ input }) => {
+      console.log("[SUB]", input.roomId, "new subscriber");
       return observable<SignalEvent>((emit) => {
         const room = getRoom(input.roomId);
         const handler = (evt: SignalEvent) => {

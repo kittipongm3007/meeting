@@ -334,13 +334,19 @@ export function useWebRTC(
         async (peerId: PeerId): Promise<void> => {
             const rec = peers?.create(userId, peerId);
             if (!rec) return;
+
             addRemoteHandlers(peerId);
+
+            // 1) ถ้ามี localStream ก็ใส่ก่อน (ของเดิม)
             await addLocalTracks(peerId);
 
-            const offer = await rec.pc.createOffer({
-                offerToReceiveAudio: true,
-                offerToReceiveVideo: true,
-            });
+            // 2) ถ้ายังไม่มี sender/track ให้เพิ่ม transceiver รับสัญญาณ
+            if (rec.pc.getTransceivers().length === 0) {
+                rec.pc.addTransceiver("audio", { direction: "recvonly" });
+                rec.pc.addTransceiver("video", { direction: "recvonly" });
+            }
+
+            const offer = await rec.pc.createOffer();
             await rec.pc.setLocalDescription(offer);
             const sdpOffer: SdpInit = { type: "offer", sdp: offer.sdp ?? "" };
             sendRef.current({
