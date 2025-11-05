@@ -4,7 +4,7 @@
   "private": true,
   "scripts": {
     "dev": "next dev",
-    "dev:ws": "tsx watch --env-file=.env.local --clear-screen=false src/server/trpc/wsServer.ts",
+    "dev:ws": "tsx --env-file=.env.local src/server/trpc/wsServer.ts",
     "build": "next build",
     "start": "next start",
     "lint": "eslint"
